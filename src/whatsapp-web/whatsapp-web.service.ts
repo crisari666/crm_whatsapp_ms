@@ -239,13 +239,13 @@ export class WhatsappWebService implements OnModuleInit {
       const { connection, lastDisconnect, qr } = update;
       const session = this.sessions.get(sessionId);
       console.log('update', JSON.stringify(update, null, 2));
+      // QR event: on a qr event, connection and lastDisconnect are empty (per Baileys docs)
       if (qr) {
         if (session?.isReady) {
           this.logger.warn(`⚠️ Session ${sessionId} is already ready, ignoring QR event`);
           return;
         }
         this.logger.log(`📱 QR received for session ${sessionId} — scan with your WhatsApp app:`);
-        // Display QR in terminal (small: false = larger, easier to scan)
         qrcode.generate(qr, { small: false });
         await this.storeSessionMetadata(sessionId, { status: 'qr_generated', lastSeen: new Date(), qrCode: qr });
         this.emitQrEvent(sessionId, qr);
@@ -278,29 +278,51 @@ export class WhatsappWebService implements OnModuleInit {
         this.emitReadyEvent(sessionId);
       }
 
+      // Close: handle per https://baileys.wiki/docs/socket/connecting/
+      // After QR scan WhatsApp forces disconnect with restartRequired (515) — create a NEW socket, current one is useless.
+      // 405 = Connection Failure / Method Not Allowed — often version or method rejection; create new socket to retry.
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        this.logger.warn(`⚠️ Session ${sessionId} disconnected: ${lastDisconnect?.error}, reconnect: ${shouldReconnect}`);
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired;
+        const isConnectionFailure405 = statusCode === 405;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+
         if (session) session.isReady = false;
-        await this.storeSessionMetadata(sessionId, { status: 'disconnected', lastSeen: new Date() });
-        try {
-          const sessionDoc = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
-          await this.whatsAppSessionModel.updateOne({ sessionId }, { $set: { isDisconnected: true, closedAt: new Date() } });
-          if (sessionDoc?._id) {
-            await this.alertsService.createDisconnectedAlert(
-              sessionDoc._id as mongoose.Types.ObjectId,
-              sessionId,
-              `Session ${sessionId} disconnected`
-            );
-          }
-        } catch (e) {
-          this.logger.error(`Failed to create disconnected alert for ${sessionId}`, e as Error);
-        }
         this.sessions.delete(sessionId);
-        if (shouldReconnect) {
-          this.logger.log(`🔄 Reconnecting session ${sessionId}...`);
+
+        if (isRestartRequired) {
+          this.logger.log(`🔄 Session ${sessionId}: restart required (e.g. after QR scan) — creating new socket...`);
+          await this.storeSessionMetadata(sessionId, { status: 'initializing', lastSeen: new Date() });
+          setImmediate(() => this.createSession(sessionId, { isRestoring: true }).catch((e) => this.logger.error(e)));
+          return;
+        }
+
+        if (isConnectionFailure405) {
+          this.logger.warn(`⚠️ Session ${sessionId}: connection failure (405). Creating new socket in 5s...`);
+          await this.storeSessionMetadata(sessionId, { status: 'disconnected', lastSeen: new Date() });
+          setTimeout(() => this.createSession(sessionId, { isRestoring: true }).catch((e) => this.logger.error(e)), 5000);
+          return;
+        }
+
+        if (!isLoggedOut) {
+          this.logger.warn(`⚠️ Session ${sessionId} disconnected (${statusCode}). Reconnecting in 3s...`);
+          await this.storeSessionMetadata(sessionId, { status: 'disconnected', lastSeen: new Date() });
+          try {
+            const sessionDoc = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
+            await this.whatsAppSessionModel.updateOne({ sessionId }, { $set: { isDisconnected: true, closedAt: new Date() } });
+            if (sessionDoc?._id) {
+              await this.alertsService.createDisconnectedAlert(
+                sessionDoc._id as mongoose.Types.ObjectId,
+                sessionId,
+                `Session ${sessionId} disconnected: ${statusCode}`
+              );
+            }
+          } catch (e) {
+            this.logger.error(`Failed to create disconnected alert for ${sessionId}`, e as Error);
+          }
           setTimeout(() => this.createSession(sessionId, { isRestoring: true }).catch((e) => this.logger.error(e)), 3000);
+        } else {
+          await this.storeSessionMetadata(sessionId, { status: 'closed', lastSeen: new Date() });
         }
       }
     });

@@ -36,7 +36,7 @@ async function bootstrap() {
       },
     },
   });
-  await app.startAllMicroservices();
+  // await app.startAllMicroservices();
 
   await app.listen(port);
   console.log(`🚀 WhatsApp Web Microservice is running on: http://localhost:${port}/rest`);
