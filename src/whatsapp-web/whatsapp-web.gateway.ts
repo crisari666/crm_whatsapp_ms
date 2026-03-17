@@ -14,7 +14,8 @@ import { Logger } from '@nestjs/common';
   cors: {
     origin: '*',
   },
-  //namespace: '/whatsapp',
+  transports: ['websocket'],
+  namespace: '/ws-rest',
 })
 export class WhatsappWebGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
@@ -58,52 +59,68 @@ export class WhatsappWebGateway implements OnGatewayConnection, OnGatewayDisconn
     this.logger.log(`Client ${client.id} joined room: ${sessionId}`);
   }
 
-  emitQrCode(sessionId: string, qr: string) {
-    const rooms = this.server.sockets.adapter.rooms
-    const roomName = this.getSessionRoom(sessionId);
-    console.log('rooms', { rooms, roomName });
-    this.server.to(roomName).emit('qr', { sessionId, qr, roomName });
+  private ensureServer(): boolean {
+    // With namespace (/ws-rest), this.server is a Namespace (has .adapter); without namespace it's Server (has .sockets.adapter)
+    if (!this.server) {
+      this.logger.warn('WebSocket server not ready, skipping emit');
+      return false;
+    }
+    const adapter = (this.server as any).sockets?.adapter ?? (this.server as any).adapter;
+    if (!adapter) {
+      this.logger.warn('WebSocket adapter not ready, skipping emit');
+      return false;
+    }
+    return true;
+  }
 
+  emitQrCode(sessionId: string, qr: string) {
+    if (!this.ensureServer()) return;
+    const roomName = this.getSessionRoom(sessionId);
+    this.server.to(roomName).emit('qr', { sessionId, qr, roomName });
     this.logger.log(`QR code emitted for session ${sessionId}`);
   }
 
   emitReady(sessionId: string) {
+    if (!this.ensureServer()) return;
     this.server.emit('ready', { sessionId });
     this.logger.log(`Ready event emitted for session ${sessionId}`);
   }
+
   emitAuthFailure(sessionId: string, error: any) {
+    if (!this.ensureServer()) return;
     this.server.to(this.getSessionRoom(sessionId)).emit('auth_failure', { sessionId, error: error.message || error });
     this.logger.log(`Auth failure emitted for session ${sessionId}`);
   }
 
   emitSessionClosed(sessionId: string, chatId?: string) {
+    if (!this.ensureServer()) return;
     this.server.emit('sessionClosed', { sessionId, chatId });
     this.logger.log(`Session closed emitted for session ${sessionId}${chatId ? `, chat ${chatId}` : ''}`);
   }
 
-
   emitNewMessage(sessionId: string, messageData: any) {
+    if (!this.ensureServer()) return;
     const room = this.getSessionRoom(sessionId);
-    console.log('emitNewMessage', room)
-    const rooms = this.server.sockets.adapter.rooms.get(room);
-    console.log('rooms', rooms);
     this.server.to(room).emit('new_message', { sessionId, message: messageData });
     this.logger.log(`New message emitted to room ${room} for session ${sessionId}`);
   }
 
   emitSyncChats(sessionId: string, payload: { nChats: number; currentChat: number; chatId?: string; messagesSynced?: number }) {
+    if (!this.ensureServer()) return;
     const room = this.getSessionRoom(sessionId);
     this.server.to(room).emit('sync_chats', { sessionId, ...payload });
     this.logger.log(`Sync chats progress emitted for session ${sessionId}: ${payload.currentChat}/${payload.nChats}`);
   }
 
   emitChatRemoved(sessionId: string, chatId: string) {
+    if (!this.ensureServer()) return;
     const room = this.getSessionRoom(sessionId);
     this.server.to(room).emit('chat_removed', { sessionId, chatId });
     this.logger.log(`Chat removed event emitted for session ${sessionId}, chat ${chatId}`);
   }
 
   emitMessageDeleted(sessionId: string, chatId: string, messageId: string) {
+    if (!this.ensureServer()) return;
     const room = this.getSessionRoom(sessionId);
     this.server.to(room).emit('message_deleted', { sessionId, chatId, messageId });
     this.logger.log(`Message deleted event emitted for session ${sessionId}, message ${messageId}`);

@@ -59,7 +59,7 @@ export class WhatsappWebService implements OnModuleInit {
 
   async onModuleInit() {
     this.logger.log('🚀 Initializing WhatsApp Web Service...');
-    await this.initializeStoredSessions();
+    //await this.initializeStoredSessions();
   }
 
   /**

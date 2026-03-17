@@ -11,6 +11,7 @@ export class WhatsappWebController {
     @Param('id') id: string,
     @Body() body?: { groupId?: string; title?: string },
   ) {
+    // return { success: true, sessionId: id, message: 'Session created successfully' };
     return this.whatsappWebService.createSession(id, body);
   }
 
