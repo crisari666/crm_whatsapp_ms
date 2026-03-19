@@ -37,7 +37,7 @@ import { RabbitService } from './rabbit.service';
             transport: Transport.RMQ,
             options: {
               urls: [rabbitMqUrl],
-              queue: 'records_ai_chats_analysis_events', // where MS2 is listening
+              queue: 'crm_back_queue', // where MS2 is listening
               queueOptions: { durable: true },
             },
           };
