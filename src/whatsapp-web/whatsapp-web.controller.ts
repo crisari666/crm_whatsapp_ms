@@ -1,4 +1,13 @@
-import { Controller, Get, Post, Body, Param, Delete, Query } from '@nestjs/common';
+import {
+  BadRequestException,
+  Controller,
+  Get,
+  Post,
+  Body,
+  Param,
+  Delete,
+  Query,
+} from '@nestjs/common';
 import { WhatsappWebService } from './whatsapp-web.service';
 import { EventPattern, Payload } from '@nestjs/microservices';
 
@@ -6,12 +15,48 @@ import { EventPattern, Payload } from '@nestjs/microservices';
 export class WhatsappWebController {
   constructor(private readonly whatsappWebService: WhatsappWebService) { }
 
+  @Get('chats')
+  async listChatsForSync(@Query('sessionId') sessionId?: string) {
+    const id = sessionId?.trim();
+    if (!id) {
+      throw new BadRequestException('Query parameter sessionId is required');
+    }
+    return this.whatsappWebService.getChatsForSyncApp(id);
+  }
+
+  @Get('chats/:chatId/messages')
+  async listMessagesForSync(
+    @Param('chatId') chatId: string,
+    @Query('sessionId') sessionId?: string,
+    @Query('limit') limitRaw?: string,
+  ) {
+    const id = sessionId?.trim();
+    if (!id) {
+      throw new BadRequestException('Query parameter sessionId is required');
+    }
+    const limit = limitRaw ? parseInt(limitRaw, 10) : 100;
+    const safeLimit =
+      Number.isFinite(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+    return this.whatsappWebService.getMessagesForSyncApp(id, chatId, safeLimit);
+  }
+
+  @Post('disconnect')
+  async disconnect(
+    @Body() body?: { sessionId?: string },
+    @Query('sessionId') querySessionId?: string,
+  ) {
+    const sid = (body?.sessionId ?? querySessionId)?.trim();
+    if (sid) {
+      return this.whatsappWebService.disconnectSession(sid);
+    }
+    return this.whatsappWebService.disconnectAllActiveSessions();
+  }
+
   @Post('session/:id')
   async createSession(
     @Param('id') id: string,
     @Body() body?: { groupId?: string; title?: string },
   ) {
-    // return { success: true, sessionId: id, message: 'Session created successfully' };
     return this.whatsappWebService.createSession(id, body);
   }
 
@@ -163,4 +208,3 @@ export class WhatsappWebController {
   }
 
 }
-

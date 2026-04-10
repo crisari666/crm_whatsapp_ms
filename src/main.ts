@@ -18,13 +18,13 @@ async function bootstrap() {
 
   app.enableCors({
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    // allowedHeaders: ['Content-Type', 'Authorization'],
   });
 
 
 
   await app.listen(port);
-  console.log(`🚀 WhatsApp Web Microservice is running on: http://localhost:${port}/rest`);
+  console.log(`🚀 WhatsApp Web Microservice is running on: http://localhost:${port}/ws-rest`);
 }
 bootstrap();

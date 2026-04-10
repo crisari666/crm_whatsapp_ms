@@ -4,6 +4,7 @@ import { Model } from 'mongoose';
 import { WhatsAppChat, WhatsAppChatDocument } from './schemas/whatsapp-chat.schema';
 import { WhatsAppMessage, WhatsAppMessageDocument } from './schemas/whatsapp-message.schema';
 import type { NormalizedChat, NormalizedMedia, NormalizedMessage } from './types/normalized-whatsapp.types';
+import type { proto, WAMessage } from '@whiskeysockets/baileys';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 
@@ -115,6 +116,33 @@ export class WhatsappStorageService {
   /**
    * Save or update a message in the database
    */
+  /**
+   * Resolve stored message for Baileys getMessage (retries / decryption). See
+   * https://baileys.wiki/docs/socket/history-sync and Baileys SocketConfig.getMessage
+   */
+  async getStoredMessageContent(
+    sessionId: string,
+    key: proto.IMessageKey,
+  ): Promise<proto.IMessage | undefined> {
+    const remoteJid = key.remoteJid ?? undefined;
+    const id = key.id ?? undefined;
+    if (!remoteJid || !id) return undefined;
+    const messageId = `${remoteJid}_${id}`;
+    const doc = await this.whatsAppMessageModel
+      .findOne({ messageId, sessionId })
+      .lean()
+      .exec();
+    if (!doc || doc.isDeleted) return undefined;
+    const raw = doc.rawData as WAMessage | undefined;
+    if (raw?.message && Object.keys(raw.message as object).length > 0) {
+      return raw.message;
+    }
+    if (typeof doc.body === 'string' && doc.body.length > 0) {
+      return { conversation: doc.body };
+    }
+    return undefined;
+  }
+
   async saveMessage(sessionId: string, message: NormalizedMessage, chatId?: string): Promise<void> {
     try {
       const messageChatId = chatId ?? message.chatId;
