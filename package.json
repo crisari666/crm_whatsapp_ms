@@ -30,7 +30,6 @@
     "@nestjs/platform-express": "^11.1.8",
     "@nestjs/platform-socket.io": "^11.1.8",
     "@nestjs/websockets": "^11.1.8",
-    "@whiskeysockets/baileys": "^6.7.9",
     "amqp-connection-manager": "^5.0.0",
     "amqplib": "^0.10.9",
     "class-transformer": "^0.5.1",
@@ -41,7 +40,8 @@
     "qrcode-terminal": "^0.12.0",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.1",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "whatsapp-web.js": "1.34.6"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.0.0",

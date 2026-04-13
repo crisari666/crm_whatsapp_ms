@@ -4,15 +4,8 @@ import { ConfigService } from '@nestjs/config';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { Connection } from 'mongoose';
 import * as mongoose from 'mongoose';
-import makeWASocket, {
-  Browsers,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  proto,
-  useMultiFileAuthState,
-  type WAMessage,
-} from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
+import { Client, RemoteAuth, type Chat, type Message } from 'whatsapp-web.js';
+import { MongoRemoteAuthStore } from './mongo-remote-auth.store';
 import { WhatsAppSession, WhatsAppSessionDocument } from './schemas/whatsapp-session.schema';
 import { WhatsAppMessage, WhatsAppMessageDocument } from './schemas/whatsapp-message.schema';
 import { WhatsappStorageService } from './whatsapp-storage.service';
@@ -23,20 +16,20 @@ import { WhatsappAlertsService } from './whatsapp-alerts.service';
 import { RabbitService } from 'src/rabbit.service';
 import type { NormalizedChat, NormalizedMessage } from './types/normalized-whatsapp.types';
 
-function parsePhoneVersion(versionStr: string | undefined): [number, number, number] | undefined {
-  if (!versionStr?.trim()) return undefined;
-  const parts = versionStr.trim().split('.').map((s) => parseInt(s, 10));
-  if (parts.length < 3 || parts.some(Number.isNaN)) return undefined;
-  return [parts[0], parts[1], parts[2]];
-}
-
-type BaileysSocket = ReturnType<typeof makeWASocket>;
+type WwebSession = {
+  client: Client;
+  isReady: boolean;
+  lastRestore?: Date;
+  isRestoring?: boolean;
+};
 
 @Injectable()
 export class WhatsappWebService implements OnModuleInit {
   private readonly logger = new Logger(WhatsappWebService.name);
-  private readonly baileysAuthPath = path.join(process.cwd(), 'baileys_auth');
-  private sessions: Map<string, { socket: BaileysSocket; isReady: boolean; lastRestore?: Date; isRestoring?: boolean }> = new Map();
+  private readonly wwebJsAuthRoot = path.join(process.cwd(), 'wwebjs_auth');
+  private readonly remoteAuthStore: MongoRemoteAuthStore;
+  private readonly remoteBackupIntervalMs = 300_000;
+  private sessions: Map<string, WwebSession> = new Map();
   private isInitializing = false;
 
   constructor(
@@ -48,10 +41,21 @@ export class WhatsappWebService implements OnModuleInit {
     private readonly storageService: WhatsappStorageService,
     private readonly gateway: WhatsappWebGateway,
     private readonly alertsService: WhatsappAlertsService,
-  ) { }
+  ) {
+    this.remoteAuthStore = new MongoRemoteAuthStore(this.connection);
+  }
+
+  private clientIdForSession(sessionId: string): string {
+    return sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  }
+
+  private remoteAuthFolderName(sessionId: string): string {
+    return `RemoteAuth-${this.clientIdForSession(sessionId)}`;
+  }
 
   async onModuleInit() {
-    this.logger.log('🚀 Initializing WhatsApp Web Service...');
+    this.logger.log('🚀 Initializing WhatsApp Web (whatsapp-web.js) service...');
+    await fs.mkdir(this.wwebJsAuthRoot, { recursive: true });
     await this.initializeStoredSessions();
   }
 
@@ -60,40 +64,30 @@ export class WhatsappWebService implements OnModuleInit {
       this.logger.warn('Session initialization already in progress');
       return;
     }
-
     this.isInitializing = true;
-
     try {
       await this.connection.readyState;
-
-      const documents = await this.whatsAppSessionModel.find({
-        status: { $in: ['ready', 'authenticated'] }
-      }).exec();
-
+      const documents = await this.whatsAppSessionModel
+        .find({ status: { $in: ['ready', 'authenticated'] } })
+        .exec();
       this.logger.log(`📱 Found ${documents.length} ready/authenticated sessions in database`);
-
       if (documents.length === 0) {
         this.logger.log('No ready/authenticated sessions to restore');
         return;
       }
-
-      const sessionIds = [...new Set(documents.map(doc => doc.sessionId))];
-
+      const sessionIds = [...new Set(documents.map((doc) => doc.sessionId))];
       for (const sessionId of sessionIds) {
         if (this.sessions.has(sessionId)) {
-          this.logger.log(`Session ${sessionId} is already active, skipping...`);
           continue;
         }
-
         try {
           this.logger.log(`🔄 Attempting to restore session: ${sessionId}`);
           await this.createSession(sessionId, { isRestoring: true });
-          this.logger.log(`✅ Session ${sessionId} restored successfully`);
+          this.logger.log(`✅ Session ${sessionId} restore initiated`);
         } catch (error) {
           this.logger.error(`❌ Failed to restore session ${sessionId}:`, (error as Error).message);
         }
       }
-
       this.logger.log(`📊 Total active sessions: ${this.sessions.size}`);
     } catch (error) {
       this.logger.error('Error initializing stored sessions:', error);
@@ -102,133 +96,97 @@ export class WhatsappWebService implements OnModuleInit {
     }
   }
 
-  private async resolveWaWebVersion(): Promise<[number, number, number] | undefined> {
-    const pinnedStr =
-      this.configService.get<string>('CONFIG_SESSION_PHONE_VERSION') ??
-      this.configService.get<string>('WA_VERSION');
-    const versionOnly =
-      this.configService.get<string>('WA_VERSION_ONLY') === 'true' ||
-      this.configService.get<string>('WA_VERSION_ONLY') === '1';
-
-    if (versionOnly) {
-      const v = parsePhoneVersion(pinnedStr);
-      if (v) {
-        this.logger.log(`WA Web version (pin): ${v.join('.')}`);
-      } else {
-        this.logger.warn('WA_VERSION_ONLY set but CONFIG_SESSION_PHONE_VERSION/WA_VERSION is missing or invalid');
-      }
-      return v;
-    }
-
-    try {
-      const fetched = await fetchLatestBaileysVersion();
-      if (fetched.error) {
-        this.logger.warn(`fetchLatestBaileysVersion: ${fetched.error}`);
-      }
-      this.logger.log(
-        `WA Web version (fetched): ${fetched.version.join('.')}, isLatest=${fetched.isLatest}`,
-      );
-      return fetched.version;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      this.logger.warn(`fetchLatestBaileysVersion failed (${msg}); trying env pin`);
-      const v = parsePhoneVersion(pinnedStr);
-      if (v) {
-        this.logger.log(`WA Web version (env fallback): ${v.join('.')}`);
-      }
-      return v;
-    }
-  }
-
-  private async storeSessionMetadata(sessionId: string, metadata: { status?: string; lastSeen?: Date; isDisconnected?: boolean; disconnectedAt?: Date; refId?: mongoose.Types.ObjectId; groupId?: mongoose.Types.ObjectId, qrCode?: string | null; title?: string }) {
+  private async storeSessionMetadata(
+    sessionId: string,
+    metadata: {
+      status?: string;
+      lastSeen?: Date;
+      isDisconnected?: boolean;
+      disconnectedAt?: Date;
+      refId?: mongoose.Types.ObjectId;
+      groupId?: mongoose.Types.ObjectId;
+      qrCode?: string | null;
+      title?: string;
+    },
+  ) {
     try {
       await this.whatsAppSessionModel.updateOne(
-        { sessionId: sessionId },
-        {
-          $set: {
-            sessionId: sessionId,
-            ...metadata,
-          }
-        },
-        { upsert: true }
+        { sessionId },
+        { $set: { sessionId, ...metadata } },
+        { upsert: true },
       );
     } catch (error) {
       this.logger.error(`Error storing session metadata for ${sessionId}:`, error);
     }
   }
 
-  private buildNormalizedMessage(waMessage: WAMessage): NormalizedMessage | null {
-    const { key, message, messageTimestamp } = waMessage;
-    if (!message || !key.remoteJid || !key.id) {
+  private wwebMessageToNormalized(msg: Message): NormalizedMessage | null {
+    try {
+      if (!msg?.id) {
+        return null;
+      }
+      const chatId = msg.fromMe ? msg.to : msg.from;
+      const messageId = msg.id._serialized;
+      const type = String(msg.type);
+      const hasMedia = !!msg.hasMedia;
+      return {
+        messageId,
+        chatId,
+        body: msg.body ?? '',
+        type,
+        from: msg.from,
+        to: msg.to,
+        author: msg.author ?? null,
+        fromMe: msg.fromMe,
+        isForwarded: msg.isForwarded,
+        forwardingScore: msg.forwardingScore ?? 0,
+        isStatus: msg.isStatus,
+        hasMedia,
+        mediaType: hasMedia ? type : null,
+        hasQuotedMsg: msg.hasQuotedMsg,
+        isStarred: msg.isStarred,
+        isGif: msg.isGif,
+        isEphemeral: msg.isEphemeral,
+        timestamp: msg.timestamp,
+        ack: typeof msg.ack === 'number' ? msg.ack : 0,
+        deviceType: msg.deviceType,
+        broadcast: msg.broadcast,
+        mentionedIds: (msg.mentionedIds ?? []).map((id) =>
+          typeof id === 'string' ? id : (id as { _serialized: string })._serialized,
+        ),
+        rawData: (msg.rawData as object) ?? {},
+      };
+    } catch {
       return null;
     }
-    const content = message;
-    let body = '';
-    let type = '';
-    if (content.conversation) {
-      body = content.conversation;
-      type = 'chat';
-    } else if (content.extendedTextMessage?.text) {
-      body = content.extendedTextMessage.text;
-      type = 'chat';
-    } else if (content.imageMessage) {
-      body = content.imageMessage.caption ?? '';
-      type = 'image';
-    } else if (content.videoMessage) {
-      body = content.videoMessage.caption ?? '';
-      type = 'video';
-    } else if (content.audioMessage) {
-      type = 'audio';
-    } else if (content.documentMessage) {
-      body = content.documentMessage.caption ?? '';
-      type = 'document';
-    } else {
-      type = Object.keys(content)[0] ?? 'unknown';
+  }
+
+  private async wwebChatToNormalized(chat: Chat): Promise<NormalizedChat> {
+    const id = chat.id._serialized;
+    const lastMsg = chat.lastMessage;
+    let lastBody: string | null = null;
+    let lastTs = chat.timestamp;
+    let lastFromMe = false;
+    if (lastMsg) {
+      lastBody = lastMsg.body || null;
+      lastTs = lastMsg.timestamp;
+      lastFromMe = lastMsg.fromMe;
     }
-    const chatId = key.remoteJid;
-    const from = key.remoteJid;
-    const to = key.participant ?? key.remoteJid;
-    const fromMe = !!key.fromMe;
-    const hasMedia =
-      !!content.imageMessage ||
-      !!content.videoMessage ||
-      !!content.audioMessage ||
-      !!content.documentMessage ||
-      !!content.stickerMessage;
-    const hasQuotedMsg = !!(
-      content.extendedTextMessage?.contextInfo ||
-      content.imageMessage?.contextInfo ||
-      content.videoMessage?.contextInfo
-    );
-    const contextInfo = (content as { contextInfo?: proto.IContextInfo }).contextInfo;
-    const timestampSec = Number(messageTimestamp ?? 0);
-    const rawData = waMessage as unknown as object;
-    const normalized: NormalizedMessage = {
-      messageId: key.id,
-      chatId,
-      body,
-      type,
-      from,
-      to,
-      author: key.participant ?? null,
-      fromMe,
-      isForwarded: !!contextInfo?.isForwarded,
-      forwardingScore: contextInfo?.forwardingScore ?? 0,
-      isStatus: key.remoteJid === 'status@broadcast',
-      hasMedia,
-      mediaType: hasMedia ? type : null,
-      hasQuotedMsg,
-      isStarred: false,
-      isGif: !!content.videoMessage?.gifPlayback,
-      isEphemeral: false,
-      timestamp: timestampSec,
-      ack: 0,
-      deviceType: undefined,
-      broadcast: false,
-      mentionedIds: content.extendedTextMessage?.contextInfo?.mentionedJid ?? [],
-      rawData,
+    return {
+      chatId: id,
+      name: chat.name || id,
+      isGroup: chat.isGroup,
+      unreadCount: chat.unreadCount,
+      timestamp: lastTs,
+      archived: chat.archived,
+      pinned: chat.pinned,
+      isReadOnly: chat.isReadOnly,
+      isMuted: chat.isMuted,
+      muteExpiration: chat.muteExpiration ?? null,
+      lastMessage: lastBody,
+      lastMessageTimestamp: lastTs,
+      lastMessageFromMe: lastFromMe,
     };
-    return normalized;
   }
 
   private buildNormalizedChatFromMessage(message: NormalizedMessage): NormalizedChat {
@@ -249,223 +207,247 @@ export class WhatsappWebService implements OnModuleInit {
     };
   }
 
-  private setupBaileysListeners(
-    socket: BaileysSocket,
-    sessionId: string,
-    saveCreds: () => Promise<void>,
-  ): void {
-    socket.ev.on('creds.update', saveCreds);
-    socket.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) {
-        const session = this.sessions.get(sessionId);
-        if (session && session.isReady) {
-          this.logger.warn(`⚠️ Session ${sessionId} is already ready, ignoring QR event`);
-          return;
-        }
-        this.logger.log(`📱 QR received for session ${sessionId}`);
-        await this.storeSessionMetadata(sessionId, {
-          status: 'qr_generated',
-          lastSeen: new Date(),
-          qrCode: qr,
-        });
-        this.emitQrEvent(sessionId, qr);
-      }
-      if (connection === 'open') {
-        this.logger.log(`✅ Session ${sessionId} is ready!`);
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          session.isReady = true;
-        }
-        await this.storeSessionMetadata(sessionId, {
-          status: 'ready',
-          lastSeen: new Date(),
-          isDisconnected: false,
-          qrCode: null,
-        });
-        const isRestoring = session?.isRestoring || false;
-        if (!isRestoring) {
-          try {
-            const storedChats = await this.storageService.getStoredChats(sessionId);
-            this.rabbitService.emitToRecordsAiChatsAnalysisService('session_ready', {
-              sessionId,
-              chats: storedChats.map((chat) => chat.chatId),
-            });
-          } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            this.logger.error(
-              `Error emitting session_ready for session ${sessionId}: ${msg}`,
-            );
-          }
-        }
-        this.emitReadyEvent(sessionId);
-      }
-      if (connection === 'close') {
-        const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        const isRestartRequired = statusCode === DisconnectReason.restartRequired;
-        const isConnectionFailure405 = statusCode === 405;
+  private normalizedChatToSyncAppRow(chat: NormalizedChat) {
+    const tsSec = chat.lastMessageTimestamp ?? chat.timestamp;
+    return {
+      id: chat.chatId,
+      contactName: chat.name || chat.chatId,
+      contactPhone: chat.isGroup
+        ? ''
+        : (chat.chatId.split('@')[0] || '').replace(/\D/g, '') || chat.chatId,
+      lastMessage: chat.lastMessage ?? '',
+      lastMessageTime: new Date(tsSec * 1000).toISOString(),
+      unreadCount: chat.unreadCount ?? 0,
+    };
+  }
 
-        this.logger.warn(
-          `⚠️ Session ${sessionId} disconnected: status=${statusCode}, loggedOut=${isLoggedOut}`,
-        );
+  private mapWwebAckToUiStatus(
+    ack: number,
+  ): 'sending' | 'sent' | 'delivered' | 'read' {
+    if (ack >= 3) return 'read';
+    if (ack >= 2) return 'delivered';
+    if (ack >= 1) return 'sent';
+    return 'sending';
+  }
 
-        const entry = this.sessions.get(sessionId);
-        if (entry) {
-          entry.isReady = false;
-        }
-        this.sessions.delete(sessionId);
+  private mapDbTypeToUiType(
+    type: string,
+  ): 'text' | 'image' | 'video' | 'audio' | 'voice' | 'document' {
+    const t = (type || 'chat').toLowerCase();
+    if (t === 'chat' || t === 'conversation') return 'text';
+    if (t === 'image' || t === 'video' || t === 'audio' || t === 'voice' || t === 'document') {
+      return t;
+    }
+    return 'text';
+  }
 
-        if (isRestartRequired) {
-          this.logger.log(
-            `🔄 Session ${sessionId}: restart required (e.g. after QR) — new socket...`,
-          );
-          await this.storeSessionMetadata(sessionId, {
-            status: 'initializing',
-            lastSeen: new Date(),
-          });
-          setImmediate(() => {
-            void this.createSession(sessionId, { isRestoring: true }).catch((err) =>
-              this.logger.error(err),
-            );
-          });
-          return;
-        }
+  private wwebMessageToSyncAppPayload(msg: Message) {
+    if (String(msg.type) === 'revoked') {
+      const ts = msg.timestamp;
+      const chatId = msg.fromMe ? msg.to : msg.from;
+      return {
+        id: msg.id._serialized,
+        chatId,
+        sender: msg.fromMe ? ('me' as const) : ('them' as const),
+        content: '',
+        type: 'text' as const,
+        timestamp: new Date(ts * 1000).toISOString(),
+        status: 'read' as const,
+        isEdited: false,
+        editHistory: [] as { content: string; editedAt: string }[],
+        isDeleted: true,
+        deletedAt: undefined as string | undefined,
+        hasMedia: false,
+        mediaType: undefined as string | undefined,
+      };
+    }
+    const normalized = this.wwebMessageToNormalized(msg);
+    if (!normalized) {
+      return null;
+    }
+    const status = this.mapWwebAckToUiStatus(normalized.ack);
+    return {
+      id: normalized.messageId,
+      chatId: normalized.chatId,
+      sender: normalized.fromMe ? ('me' as const) : ('them' as const),
+      content: normalized.body ?? '',
+      type: this.mapDbTypeToUiType(normalized.type),
+      timestamp: new Date(normalized.timestamp * 1000).toISOString(),
+      status,
+      isEdited: false,
+      editHistory: [] as { content: string; editedAt: string }[],
+      isDeleted: false,
+      deletedAt: undefined as string | undefined,
+      hasMedia: !!normalized.hasMedia,
+      mediaType: normalized.mediaType ?? undefined,
+    };
+  }
 
-        if (isConnectionFailure405) {
-          this.logger.warn(
-            `Session ${sessionId}: connection failure (405) — often stale WA Web version; retrying in 3s`,
-          );
-          await this.storeSessionMetadata(sessionId, {
-            status: 'disconnected',
-            lastSeen: new Date(),
-          });
-          setTimeout(() => {
-            void this.createSession(sessionId, { isRestoring: true }).catch((err) =>
-              this.logger.error(err),
-            );
-          }, 3000);
-          return;
-        }
-
-        await this.storeSessionMetadata(sessionId, {
-          status: 'disconnected',
-          lastSeen: new Date(),
-        });
-        try {
-          const sessionDoc = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
-          await this.whatsAppSessionModel.updateOne(
-            { sessionId },
-            { $set: { isDisconnected: true, closedAt: new Date() } },
-          );
-          if (sessionDoc?._id) {
-            await this.alertsService.createDisconnectedAlert(
-              sessionDoc._id as mongoose.Types.ObjectId,
-              sessionId,
-              `Session ${sessionId} disconnected (code ${statusCode ?? 'unknown'})`,
-            );
-          }
-        } catch (e) {
-          this.logger.error(`Failed to create disconnected alert for ${sessionId}`, e as Error);
-        }
-
-        if (isLoggedOut) {
-          this.emitAuthFailureEvent(sessionId, lastDisconnect?.error);
-          await this.handleSessionClosed(sessionId);
-          return;
-        }
-
-        this.logger.warn(`Session ${sessionId}: reconnecting in 3s...`);
-        setTimeout(() => {
-          void this.createSession(sessionId, { isRestoring: true }).catch((err) =>
-            this.logger.error(err),
-          );
-        }, 3000);
-      }
-    });
-    socket.ev.on('messages.upsert', async (upsert) => {
-      if (upsert.type !== 'notify') {
+  private setupWwebClientListeners(client: Client, sessionId: string): void {
+    client.on('qr', async (qr) => {
+      const session = this.sessions.get(sessionId);
+      if (session?.isReady) {
+        this.logger.warn(`⚠️ Session ${sessionId} already ready, ignoring QR`);
         return;
       }
-      for (const waMessage of upsert.messages) {
+      this.logger.log(`📱 QR received for session ${sessionId}`);
+      await this.storeSessionMetadata(sessionId, {
+        status: 'qr_generated',
+        lastSeen: new Date(),
+        qrCode: qr,
+      });
+      this.emitQrEvent(sessionId, qr);
+    });
+
+    client.on('authenticated', () => {
+      this.logger.log(`🔐 Session ${sessionId} authenticated`);
+    });
+
+    client.on('auth_failure', async (message) => {
+      this.logger.error(`Auth failure ${sessionId}: ${message}`);
+      this.emitAuthFailureEvent(sessionId, message);
+      await this.storeSessionMetadata(sessionId, {
+        status: 'error',
+        lastSeen: new Date(),
+        qrCode: null,
+      });
+    });
+
+    client.on('ready', async () => {
+      this.logger.log(`✅ Session ${sessionId} is ready (whatsapp-web.js)`);
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.isReady = true;
+      }
+      await this.storeSessionMetadata(sessionId, {
+        status: 'ready',
+        lastSeen: new Date(),
+        isDisconnected: false,
+        qrCode: null,
+      });
+      const isRestoring = session?.isRestoring || false;
+      if (!isRestoring) {
         try {
-          const normalized = this.buildNormalizedMessage(waMessage);
-          if (!normalized) {
-            continue;
-          }
-          await this.storageService.saveMessage(sessionId, normalized);
-          const normalizedChat = this.buildNormalizedChatFromMessage(normalized);
-          await this.storageService.saveChat(sessionId, normalizedChat);
-          const messageData: Record<string, unknown> = {
-            messageId: normalized.messageId,
-            chatId: normalized.chatId,
-            body: normalized.body,
-            type: normalized.type,
-            from: normalized.from,
-            to: normalized.to,
-            author: normalized.author,
-            fromMe: normalized.fromMe,
-            timestamp: normalized.timestamp,
-            isDeleted: false,
-            deletedAt: null,
-            deletedBy: null,
-            edition: [],
-            hasMedia: normalized.hasMedia,
-            mediaType: normalized.mediaType,
-            hasQuotedMsg: normalized.hasQuotedMsg,
-            isForwarded: normalized.isForwarded,
-            isStarred: normalized.isStarred,
-          };
-          this.emitNewMessageEvent(sessionId, messageData);
-          this.rabbitService.emitToRecordsAiChatsAnalysisService('message_create', {
+          const storedChats = await this.storageService.getStoredChats(sessionId);
+          this.rabbitService.emitToRecordsAiChatsAnalysisService('session_ready', {
             sessionId,
-            message: messageData,
+            chats: storedChats.map((chat) => chat.chatId),
           });
         } catch (error: unknown) {
           const msg = error instanceof Error ? error.message : String(error);
-          this.logger.error(
-            `Error handling messages.upsert for session ${sessionId}: ${msg}`,
+          this.logger.error(`Error emitting session_ready for ${sessionId}: ${msg}`);
+        }
+      }
+      this.emitReadyEvent(sessionId);
+    });
+
+    client.on('remote_session_saved', () => {
+      this.logger.log(`RemoteAuth session persisted to MongoDB for ${sessionId}`);
+    });
+
+    client.on('disconnected', async (reason) => {
+      this.logger.warn(`⚠️ Session ${sessionId} disconnected: ${reason}`);
+      const entry = this.sessions.get(sessionId);
+      if (entry) {
+        entry.isReady = false;
+      }
+      this.sessions.delete(sessionId);
+      await this.storeSessionMetadata(sessionId, {
+        status: 'disconnected',
+        lastSeen: new Date(),
+        qrCode: null,
+      });
+      try {
+        const sessionDoc = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
+        await this.whatsAppSessionModel.updateOne(
+          { sessionId },
+          { $set: { isDisconnected: true, closedAt: new Date() } },
+        );
+        if (sessionDoc?._id) {
+          await this.alertsService.createDisconnectedAlert(
+            sessionDoc._id as mongoose.Types.ObjectId,
+            sessionId,
+            `Session ${sessionId} disconnected (${String(reason)})`,
           );
         }
+      } catch (e) {
+        this.logger.error(`Failed disconnected follow-up for ${sessionId}`, e as Error);
+      }
+    });
+
+    client.on('message_create', async (msg) => {
+      try {
+        const normalized = this.wwebMessageToNormalized(msg);
+        if (!normalized) {
+          return;
+        }
+        await this.storageService.saveMessage(sessionId, normalized);
+        const normalizedChat = this.buildNormalizedChatFromMessage(normalized);
+        await this.storageService.saveChat(sessionId, normalizedChat);
+        const messageData: Record<string, unknown> = {
+          messageId: normalized.messageId,
+          chatId: normalized.chatId,
+          body: normalized.body,
+          type: normalized.type,
+          from: normalized.from,
+          to: normalized.to,
+          author: normalized.author,
+          fromMe: normalized.fromMe,
+          timestamp: normalized.timestamp,
+          isDeleted: false,
+          deletedAt: null,
+          deletedBy: null,
+          edition: [],
+          hasMedia: normalized.hasMedia,
+          mediaType: normalized.mediaType,
+          hasQuotedMsg: normalized.hasQuotedMsg,
+          isForwarded: normalized.isForwarded,
+          isStarred: normalized.isStarred,
+        };
+        this.emitNewMessageEvent(sessionId, messageData);
+        this.rabbitService.emitToRecordsAiChatsAnalysisService('message_create', {
+          sessionId,
+          message: messageData,
+        });
+      } catch (error: unknown) {
+        const msgErr = error instanceof Error ? error.message : String(error);
+        this.logger.error(`message_create ${sessionId}: ${msgErr}`);
       }
     });
   }
 
-  async createSession(sessionId: string, options?: { groupId?: string; isRestoring?: boolean; title?: string }) {
+  async createSession(
+    sessionId: string,
+    options?: { groupId?: string; isRestoring?: boolean; title?: string },
+  ) {
     try {
       const existingSession = this.sessions.get(sessionId);
       const storedSession = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
+      console.log('storedSession', JSON.stringify({storedSession}, null, 2));
       const dbReady =
         !!storedSession &&
         (storedSession.status === 'ready' || storedSession.status === 'authenticated');
 
       if (existingSession?.isReady && dbReady) {
-        this.logger.log(`Session ${sessionId} already active (socket ready)`);
-        return {
-          success: true,
-          sessionId,
-          message: 'Session already active',
-        };
+        this.logger.log(`Session ${sessionId} already active`);
+        return { success: true, sessionId, message: 'Session already active' };
       }
 
       if (existingSession) {
-        this.logger.log(
-          `Session ${sessionId}: replacing existing socket (${existingSession.isReady ? 'stale or reconnect' : 'not ready'})`,
-        );
+        this.logger.log(`Session ${sessionId}: replacing existing client`);
         try {
-          existingSession.socket.end(undefined);
+          await existingSession.client.destroy();
         } catch (error: unknown) {
           const msg = error instanceof Error ? error.message : String(error);
-          this.logger.warn(`Error ending previous socket: ${msg}`);
+          this.logger.warn(`Error destroying previous client: ${msg}`);
         }
         this.sessions.delete(sessionId);
       }
 
       if (dbReady) {
-        this.logger.log(`🔄 Restoring authenticated session ${sessionId} from local auth state...`);
+        this.logger.log(`🔄 Restoring session ${sessionId} from MongoDB (RemoteAuth)...`);
       }
 
-      this.logger.log(`🔨 Creating session: ${sessionId}`);
       let refObjectId: mongoose.Types.ObjectId | undefined;
       if (options?.groupId && mongoose.Types.ObjectId.isValid(options.groupId)) {
         refObjectId = new mongoose.Types.ObjectId(options.groupId);
@@ -476,27 +458,40 @@ export class WhatsappWebService implements OnModuleInit {
         ...(refObjectId ? { refId: refObjectId } : {}),
         ...(options?.title ? { title: options.title } : {}),
       });
-      const authDir = path.join(this.baileysAuthPath, sessionId);
-      await fs.mkdir(authDir, { recursive: true });
-      const { state, saveCreds } = await useMultiFileAuthState(authDir);
-      const version = await this.resolveWaWebVersion();
-      const socket = makeWASocket({
-        auth: state,
-        ...(version ? { version } : {}),
-        printQRInTerminal: true,
-        browser: Browsers.ubuntu('CRM'),
-        shouldSyncHistoryMessage: () => false,
-        syncFullHistory: false,
+
+      const clientId = this.clientIdForSession(sessionId);
+      const client = new Client({
+        authStrategy: new RemoteAuth({
+          store: this.remoteAuthStore,
+          clientId,
+          dataPath: this.wwebJsAuthRoot,
+          backupSyncIntervalMs: this.remoteBackupIntervalMs,
+        }),
+        puppeteer: {
+          headless: true,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+          ],
+        },
       });
-      this.setupBaileysListeners(socket, sessionId, saveCreds);
-      const isRestoring =
-        options?.isRestoring !== undefined ? options.isRestoring : dbReady;
+
+      const isRestoring = options?.isRestoring !== undefined ? options.isRestoring : dbReady;
       this.sessions.set(sessionId, {
-        socket,
+        client,
         isReady: false,
         lastRestore: new Date(),
         isRestoring,
       });
+
+      this.setupWwebClientListeners(client, sessionId);
+      await client.initialize();
+
       return {
         success: true,
         sessionId,
@@ -518,10 +513,10 @@ export class WhatsappWebService implements OnModuleInit {
     const session = this.sessions.get(sessionId);
     if (session) {
       try {
-        session.socket.end(undefined);
+        await session.client.destroy();
       } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        this.logger.warn(`Error ending socket for ${sessionId}: ${msg}`);
+        this.logger.warn(`Error destroying client ${sessionId}: ${msg}`);
       }
       this.sessions.delete(sessionId);
     }
@@ -534,12 +529,8 @@ export class WhatsappWebService implements OnModuleInit {
       { sessionId },
       { $set: { isDisconnected: true, closedAt: new Date() } },
     );
-    this.logger.log(`🔌 Session ${sessionId} disconnected (socket closed, credentials kept)`);
-    return {
-      success: true,
-      sessionId,
-      message: 'Disconnected',
-    };
+    this.logger.log(`🔌 Session ${sessionId} disconnected`);
+    return { success: true, sessionId, message: 'Disconnected' };
   }
 
   async disconnectAllActiveSessions() {
@@ -549,7 +540,7 @@ export class WhatsappWebService implements OnModuleInit {
         success: true,
         disconnected: [] as string[],
         count: 0,
-        message: 'No active socket sessions',
+        message: 'No active sessions',
       };
     }
     const disconnected: string[] = [];
@@ -569,12 +560,26 @@ export class WhatsappWebService implements OnModuleInit {
     try {
       const session = this.sessions.get(sessionId);
       if (session) {
-        session.socket.end(undefined);
+        try {
+          await session.client.logout();
+        } catch {
+          try {
+            await session.client.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
         this.sessions.delete(sessionId);
       }
-
-      await this.whatsAppSessionModel.deleteMany({ sessionId: sessionId });
-      this.logger.log(`🧹 Session ${sessionId} destroyed and removed from MongoDB`);
+      try {
+        await this.remoteAuthStore.delete({ session: this.remoteAuthFolderName(sessionId) });
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.logger.warn(`RemoteAuth GridFS cleanup for ${sessionId}: ${msg}`);
+      }
+      await this.removeRemoteAuthLocalData(sessionId);
+      await this.whatsAppSessionModel.deleteMany({ sessionId });
+      this.logger.log(`🧹 Session ${sessionId} destroyed`);
       return { success: true, message: 'Session destroyed successfully' };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -589,23 +594,21 @@ export class WhatsappWebService implements OnModuleInit {
       if (!session) {
         throw new Error(`Session ${sessionId} not found`);
       }
-
       if (!session.isReady) {
         throw new Error(`Session ${sessionId} is not ready yet`);
       }
-
       const formattedPhone = phone.replace(/\D/g, '');
-      const jid = `${formattedPhone}@s.whatsapp.net`;
-      const result = await session.socket.sendMessage(jid, { text: message });
+      const jid = `${formattedPhone}@c.us`;
+      const sent = await session.client.sendMessage(jid, message);
       this.logger.log(`📤 Message sent to ${phone} via session ${sessionId}`);
       return {
         success: true,
-        messageId: result.key.id,
-        timestamp: Number(result.messageTimestamp ?? 0) * 1000,
+        messageId: sent.id._serialized,
+        timestamp: sent.timestamp * 1000,
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error sending message via session ${sessionId}:`, error);
+      this.logger.error(`Error sending message via ${sessionId}:`, error);
       throw new Error(`Failed to send message: ${msg}`);
     }
   }
@@ -618,47 +621,39 @@ export class WhatsappWebService implements OnModuleInit {
     return {
       exists: true,
       ready: session.isReady,
-      state: session.socket.user,
+      state: session.client.info,
     };
   }
 
   async getSession(sessionId: string) {
-    const session = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
-    return session;
+    return this.whatsAppSessionModel.findOne({ sessionId }).exec();
   }
 
   async getSessionQrCode(sessionId: string) {
     try {
       const session = await this.whatsAppSessionModel.findOne({ sessionId }).exec();
-
       if (!session) {
-        return {
-          success: false,
-          message: 'Session not found',
-          qrCode: null
-        };
+        return { success: false, message: 'Session not found', qrCode: null };
       }
-
       if (!session.qrCode) {
         return {
           success: false,
           message: 'QR code not generated yet',
           status: session.status,
-          qrCode: null
+          qrCode: null,
         };
       }
-
       return {
         success: true,
         sessionId: session.sessionId,
         status: session.status,
         qrCode: session.qrCode,
         qrAttempts: session.qrAttempts,
-        maxQrAttempts: session.maxQrAttempts
+        maxQrAttempts: session.maxQrAttempts,
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting QR code for session ${sessionId}:`, error);
+      this.logger.error(`Error getting QR for ${sessionId}:`, error);
       throw new Error(`Failed to get QR code: ${msg}`);
     }
   }
@@ -678,7 +673,7 @@ export class WhatsappWebService implements OnModuleInit {
   async getStoredSessions() {
     try {
       const sessions = await this.whatsAppSessionModel.find({}).exec();
-      return sessions.map(session => ({
+      return sessions.map((session) => ({
         _id: session._id,
         sessionId: session.sessionId,
         status: session.status,
@@ -694,110 +689,79 @@ export class WhatsappWebService implements OnModuleInit {
     }
   }
 
-  getClient(sessionId: string): BaileysSocket | null {
+  getClient(sessionId: string): Client | null {
     const session = this.sessions.get(sessionId);
-    return session ? session.socket : null;
+    return session ? session.client : null;
+  }
+
+  async getChatsFromSession(sessionId: string): Promise<NormalizedChat[]> {
+    const session = this.sessions.get(sessionId);
+    if (!session?.isReady) {
+      throw new Error(`Session ${sessionId} is not connected or not ready`);
+    }
+    const chats = await session.client.getChats();
+    const out: NormalizedChat[] = [];
+    for (const c of chats) {
+      const sid = c.id._serialized;
+      if (sid.includes('status@broadcast')) {
+        continue;
+      }
+      out.push(await this.wwebChatToNormalized(c));
+    }
+    return out;
   }
 
   async getChats(sessionId: string) {
     try {
-      const storedChats = await this.storageService.getStoredChats(sessionId);
-
-      return storedChats.map(chat => ({
-        id: chat.chatId,
-        name: chat.name,
-        isGroup: chat.isGroup,
-        unreadCount: chat.unreadCount,
-        lastMessage: chat.lastMessage,
-        timestamp: chat.timestamp,
-        archive: chat.archived,
-        pinned: chat.pinned,
+      const normalizedChats = await this.getChatsFromSession(sessionId);
+      return normalizedChats.map((n) => ({
+        id: n.chatId,
+        name: n.name,
+        isGroup: n.isGroup,
+        unreadCount: n.unreadCount,
+        lastMessage: n.lastMessage,
+        timestamp: n.timestamp,
+        archive: n.archived,
+        pinned: n.pinned,
       }));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting chats from session ${sessionId}:`, error);
+      this.logger.error(`Error getting chats for ${sessionId}:`, error);
       throw new Error(`Failed to get chats: ${msg}`);
     }
   }
 
   async getChatsForSyncApp(sessionId: string) {
     try {
-      const storedChats = await this.storageService.getStoredChats(sessionId);
-      return storedChats
-        .filter((chat) => !chat.deleted)
-        .map((chat) => {
-          const tsSec = chat.lastMessageTimestamp ?? chat.timestamp;
-          return {
-            id: chat.chatId,
-            contactName: chat.name || chat.chatId,
-            contactPhone: chat.isGroup
-              ? ''
-              : (chat.chatId.split('@')[0] || '').replace(/\D/g, '') || chat.chatId,
-            lastMessage: chat.lastMessage ?? '',
-            lastMessageTime: new Date(tsSec * 1000).toISOString(),
-            unreadCount: chat.unreadCount ?? 0,
-          };
-        });
+      const normalizedChats = await this.getChatsFromSession(sessionId);
+      return normalizedChats.map((c) => this.normalizedChatToSyncAppRow(c));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting sync-app chats for session ${sessionId}:`, error);
+      this.logger.error(`Error getChatsForSyncApp ${sessionId}:`, error);
       throw new Error(`Failed to get chats: ${msg}`);
     }
   }
 
-  private mapAckToUiStatus(
-    ack: number,
-  ): 'sending' | 'sent' | 'delivered' | 'read' {
-    if (ack >= 3) return 'read';
-    if (ack >= 2) return 'delivered';
-    if (ack >= 1) return 'sent';
-    return 'sent';
-  }
-
-  private mapDbTypeToUiType(
-    type: string,
-  ): 'text' | 'image' | 'video' | 'audio' | 'voice' | 'document' {
-    const t = (type || 'chat').toLowerCase();
-    if (t === 'chat' || t === 'conversation') return 'text';
-    if (t === 'image' || t === 'video' || t === 'audio' || t === 'voice' || t === 'document') {
-      return t;
-    }
-    return 'text';
-  }
-
-  async getMessagesForSyncApp(
-    sessionId: string,
-    chatId: string,
-    limit: number = 100,
-  ) {
+  async getMessagesForSyncApp(sessionId: string, chatId: string, limit: number = 100) {
     try {
-      const rows = await this.getStoredMessages(sessionId, chatId, {
-        limit,
-        includeDeleted: false,
-      });
-      return rows.map((msg) => ({
-        id: msg.messageId,
-        chatId: msg.chatId,
-        sender: msg.fromMe ? ('me' as const) : ('them' as const),
-        content: msg.body ?? '',
-        type: this.mapDbTypeToUiType(msg.type),
-        timestamp: new Date(msg.timestamp * 1000).toISOString(),
-        status: this.mapAckToUiStatus(msg.ack ?? 0),
-        isEdited: Array.isArray(msg.edition) && msg.edition.length > 0,
-        editHistory: [] as { content: string; editedAt: string }[],
-        isDeleted: !!msg.isDeleted,
-        deletedAt: msg.deletedAt
-          ? new Date(msg.deletedAt).toISOString()
-          : undefined,
-        hasMedia: !!msg.hasMedia,
-        mediaType: msg.mediaType ?? undefined,
-      }));
+      const session = this.sessions.get(sessionId);
+      if (!session?.isReady) {
+        throw new Error(`Session ${sessionId} is not connected or not ready`);
+      }
+      const id = decodeURIComponent(chatId);
+      const chat = await session.client.getChatById(id);
+      const messages = await chat.fetchMessages({ limit });
+      const out = [];
+      for (const m of messages) {
+        const row = this.wwebMessageToSyncAppPayload(m);
+        if (row) {
+          out.push(row);
+        }
+      }
+      return out;
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(
-        `Error getting sync-app messages for ${sessionId}/${chatId}:`,
-        error,
-      );
+      this.logger.error(`getMessagesForSyncApp ${sessionId}/${chatId}:`, error);
       throw new Error(`Failed to get messages: ${msg}`);
     }
   }
@@ -805,12 +769,10 @@ export class WhatsappWebService implements OnModuleInit {
   async getChatMessages(sessionId: string, chatId: string, limit?: number) {
     try {
       const storedMessages = await this.getStoredMessages(sessionId, chatId, {
-        limit: limit || 50
+        limit: limit || 50,
       });
-
-      this.logger.log(`📥 Returning ${storedMessages.length} stored messages from database`);
-
-      return storedMessages.map(msg => ({
+      this.logger.log(`📥 Returning ${storedMessages.length} stored messages`);
+      return storedMessages.map((msg) => ({
         id: msg.messageId,
         body: msg.body,
         from: msg.from,
@@ -824,70 +786,83 @@ export class WhatsappWebService implements OnModuleInit {
         isStarred: msg.isStarred,
         isDeleted: msg.isDeleted,
         type: msg.type,
-        rawData: msg.rawData
+        rawData: msg.rawData,
       }));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting messages from chat ${chatId} in session ${sessionId}:`, error);
+      this.logger.error(`getChatMessages ${chatId}:`, error);
       throw new Error(`Failed to get messages: ${msg}`);
     }
   }
 
   async syncRecentMessages(sessionId: string, chatId?: string) {
-    try {
-      this.logger.log(
-        `🔄 syncRecentMessages called for session ${sessionId}, chatId=${chatId || 'all'} (Baileys mode uses stored messages only)`,
-      );
-      return { success: true, chatsProcessed: 0 };
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error syncing recent messages for session ${sessionId}:`, error);
-      throw new Error(`Failed to sync recent messages: ${msg}`);
-    }
+    void sessionId;
+    void chatId;
+    return { success: true, chatsProcessed: 0 };
   }
 
   async syncChatsWithProgress(sessionId: string, limitPerChat?: number) {
-    void limitPerChat;
+    const lim = limitPerChat && limitPerChat > 0 ? Math.min(limitPerChat, 500) : 100;
     try {
-      const storedChats = await this.storageService.getStoredChats(sessionId);
-      const nChats = storedChats.length;
+      const session = this.sessions.get(sessionId);
+      if (!session?.isReady) {
+        throw new Error(`Session ${sessionId} is not connected or not ready`);
+      }
+      const client = session.client;
+      const chats = (await client.getChats()).filter(
+        (c) => !c.id._serialized.includes('status@broadcast'),
+      );
+      const nChats = chats.length;
       this.gateway.emitSyncChats(sessionId, {
         nChats,
         currentChat: 0,
         messagesSynced: 0,
       });
-      for (let i = 0; i < storedChats.length; i++) {
-        const chat = storedChats[i];
+      for (let i = 0; i < chats.length; i++) {
+        const chat = chats[i];
+        const jid = chat.id._serialized;
+        const normalized = await this.wwebChatToNormalized(chat);
+        await this.storageService.saveChat(sessionId, normalized);
+        const messages = await chat.fetchMessages({ limit: lim });
+        for (const m of messages) {
+          const n = this.wwebMessageToNormalized(m);
+          if (n) {
+            await this.storageService.saveMessage(sessionId, n);
+          }
+        }
         this.gateway.emitSyncChats(sessionId, {
           nChats,
           currentChat: i + 1,
-          chatId: chat.chatId,
-          messagesSynced: 0,
+          chatId: jid,
+          messagesSynced: messages.length,
         });
       }
-      this.logger.log(`✅ Synchronization (stored data) completed for session ${sessionId}`);
+      this.logger.log(`✅ Sync completed for session ${sessionId}`);
       return {
         success: true,
         chatsProcessed: nChats,
-        message: 'Synchronization completed using stored chats only',
+        message: `Synchronized ${nChats} chats`,
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error synchronizing chats with progress for session ${sessionId}:`, error);
+      this.logger.error(`syncChatsWithProgress ${sessionId}:`, error);
       throw new Error(`Failed to synchronize chats: ${msg}`);
     }
   }
 
-  async getStoredMessages(sessionId: string, chatId?: string, options?: {
-    includeDeleted?: boolean;
-    limit?: number;
-    skip?: number;
-    startTimestamp?: number;
-    endTimestamp?: number;
-  }) {
+  async getStoredMessages(
+    sessionId: string,
+    chatId?: string,
+    options?: {
+      includeDeleted?: boolean;
+      limit?: number;
+      skip?: number;
+      startTimestamp?: number;
+      endTimestamp?: number;
+    },
+  ) {
     try {
       const query: Record<string, unknown> = { sessionId };
-
       if (chatId) {
         query.chatId = chatId;
       }
@@ -903,7 +878,6 @@ export class WhatsappWebService implements OnModuleInit {
         }
         (query.timestamp as Record<string, number>).$lte = options.endTimestamp;
       }
-
       let q = this.whatsAppMessageModel
         .find(query)
         .sort({ timestamp: 1 })
@@ -912,8 +886,7 @@ export class WhatsappWebService implements OnModuleInit {
         q = q.limit(Math.min(options.limit, 500));
       }
       const messages = await q.exec();
-
-      return messages.map(msg => ({
+      return messages.map((msg) => ({
         messageId: msg.messageId,
         chatId: msg.chatId,
         body: msg.body,
@@ -937,7 +910,7 @@ export class WhatsappWebService implements OnModuleInit {
       }));
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting stored messages: ${msg}`);
+      this.logger.error(`getStoredMessages: ${msg}`);
       throw new Error(`Failed to get stored messages: ${msg}`);
     }
   }
@@ -945,36 +918,27 @@ export class WhatsappWebService implements OnModuleInit {
   async getDeletedMessages(sessionId: string, chatId?: string, limit?: number) {
     try {
       const query: Record<string, unknown> = { sessionId, isDeleted: true };
-
       if (chatId) {
         query.chatId = chatId;
       }
-
-      const messages = await this.whatsAppMessageModel
+      return this.whatsAppMessageModel
         .find(query)
         .sort({ deletedAt: -1 })
         .limit(limit || 50)
         .exec();
-
-      return messages;
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting deleted messages: ${msg}`);
+      this.logger.error(`getDeletedMessages: ${msg}`);
       throw new Error(`Failed to get deleted messages: ${msg}`);
     }
   }
 
   async getStoredMessageById(sessionId: string, messageId: string) {
     try {
-      const message = await this.whatsAppMessageModel.findOne({
-        sessionId,
-        messageId
-      }).exec();
-
+      const message = await this.whatsAppMessageModel.findOne({ sessionId, messageId }).exec();
       if (!message) {
         throw new Error('Message not found');
       }
-
       return {
         messageId: message.messageId,
         chatId: message.chatId,
@@ -996,22 +960,17 @@ export class WhatsappWebService implements OnModuleInit {
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting stored message: ${msg}`);
+      this.logger.error(`getStoredMessageById: ${msg}`);
       throw new Error(`Failed to get message: ${msg}`);
     }
   }
 
   async getMessageEditHistory(sessionId: string, messageId: string) {
     try {
-      const message = await this.whatsAppMessageModel.findOne({
-        sessionId,
-        messageId
-      }).exec();
-
+      const message = await this.whatsAppMessageModel.findOne({ sessionId, messageId }).exec();
       if (!message) {
         throw new Error('Message not found');
       }
-
       return {
         messageId: message.messageId,
         currentBody: message.body,
@@ -1020,17 +979,20 @@ export class WhatsappWebService implements OnModuleInit {
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error getting message edit history: ${msg}`);
+      this.logger.error(`getMessageEditHistory: ${msg}`);
       throw new Error(`Failed to get edit history: ${msg}`);
     }
   }
 
-  async getStoredChats(sessionId: string, options?: {
-    archived?: boolean;
-    isGroup?: boolean;
-    limit?: number;
-    skip?: number;
-  }) {
+  async getStoredChats(
+    sessionId: string,
+    options?: {
+      archived?: boolean;
+      isGroup?: boolean;
+      limit?: number;
+      skip?: number;
+    },
+  ) {
     return this.storageService.getStoredChats(sessionId, options);
   }
 
@@ -1040,16 +1002,12 @@ export class WhatsappWebService implements OnModuleInit {
 
   async sendRMMessage(payload: unknown) {
     try {
-      this.logger.log(`📤 Sending RM message to ms2: ${JSON.stringify(payload)}`);
+      this.logger.log(`📤 sendRMMessage: ${JSON.stringify(payload)}`);
       this.rabbitService.emitToRecordsAiChatsAnalysisService('test_message', payload);
-      return {
-        success: true,
-        message: 'Message sent to RabbitMQ',
-        payload
-      };
+      return { success: true, message: 'Message sent to RabbitMQ', payload };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error sending RM message: ${msg}`);
+      this.logger.error(`sendRMMessage: ${msg}`);
       throw new Error(`Failed to send RM message: ${msg}`);
     }
   }
@@ -1069,7 +1027,7 @@ export class WhatsappWebService implements OnModuleInit {
       return { success: true };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Error setting groupId for message ${messageId} in session ${sessionId}: ${msg}`);
+      this.logger.error(`setMessageGroup: ${msg}`);
       throw new Error(`Failed to set groupId: ${msg}`);
     }
   }
@@ -1090,12 +1048,32 @@ export class WhatsappWebService implements OnModuleInit {
     this.gateway.emitNewMessage(sessionId, messageData);
   }
 
+  private async removeRemoteAuthLocalData(sessionId: string): Promise<void> {
+    const cid = this.clientIdForSession(sessionId);
+    const base = this.wwebJsAuthRoot;
+    const paths = [
+      path.join(base, this.remoteAuthFolderName(sessionId)),
+      path.join(base, `wwebjs_temp_session_${cid}`),
+      path.join(base, `${this.remoteAuthFolderName(sessionId)}.zip`),
+    ];
+    for (const p of paths) {
+      try {
+        await fs.rm(p, { recursive: true, force: true });
+        this.logger.log(`Removed RemoteAuth path: ${p}`);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.logger.warn(`Could not remove ${p}: ${msg}`);
+      }
+    }
+  }
+
   private async handleSessionClosed(sessionId: string, chatId?: string) {
     try {
       const session = this.sessions.get(sessionId);
       if (session) {
         session.isReady = false;
       }
+      await this.removeRemoteAuthLocalData(sessionId);
       await this.storeSessionMetadata(sessionId, {
         status: 'closed',
         lastSeen: new Date(),
@@ -1103,7 +1081,7 @@ export class WhatsappWebService implements OnModuleInit {
       this.gateway.emitSessionClosed(sessionId, chatId);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      this.logger.error(`Failed to handle session closed for ${sessionId}: ${msg}`);
+      this.logger.error(`handleSessionClosed ${sessionId}: ${msg}`);
     }
   }
 }

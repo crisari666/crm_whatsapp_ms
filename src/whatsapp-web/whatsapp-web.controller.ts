@@ -203,8 +203,19 @@ export class WhatsappWebController {
   }
 
   @EventPattern('remove_session')
-  async handleIncoming(@Payload() data: any) {
-    this.whatsappWebService.destroySession(data);
+  async handleIncoming(@Payload() data: unknown) {
+    const sessionId =
+      typeof data === 'string'
+        ? data
+        : data &&
+            typeof data === 'object' &&
+            data !== null &&
+            'sessionId' in data
+          ? String((data as { sessionId: unknown }).sessionId)
+          : null;
+    if (sessionId) {
+      await this.whatsappWebService.destroySession(sessionId);
+    }
   }
 
 }

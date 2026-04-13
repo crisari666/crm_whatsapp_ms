@@ -61,3 +61,4 @@ yarn.lock
 package-lock.json
 media/
 baileys_auth/
+wwebjs_auth/*
