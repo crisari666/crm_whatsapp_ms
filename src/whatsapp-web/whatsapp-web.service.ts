@@ -411,23 +411,30 @@ export class WhatsappWebService implements OnModuleInit {
     }
   }
 
-  private getSessionBackfillLimit(): number {
-    const raw = Number.parseInt(process.env.WHATSAPP_SESSION_BACKFILL_LIMIT ?? '30', 10);
+  private getSessionBackfillBatchSize(): number {
+    const rawValue =
+      process.env.WHATSAPP_SESSION_BACKFILL_BATCH_SIZE ??
+      process.env.WHATSAPP_SESSION_BACKFILL_LIMIT ??
+      '500';
+    const raw = Number.parseInt(rawValue, 10);
     if (!Number.isFinite(raw) || raw <= 0) {
-      return 30;
+      return 500;
     }
-    return Math.min(raw, 100);
+    return Math.min(raw, 500);
   }
 
   private async emitRecentBackfillForSession(sessionId: string): Promise<void> {
-    const limit = this.getSessionBackfillLimit();
-    const chats = await this.storageService.getStoredChats(sessionId, { limit: 200 });
-    for (const chat of chats) {
-      const messages = await this.getStoredMessages(sessionId, chat.chatId, {
-        includeDeleted: false,
-        limit,
+    const batchSize = this.getSessionBackfillBatchSize();
+    let chatsSkip = 0;
+    while (true) {
+      const chats = await this.storageService.getStoredChats(sessionId, {
+        limit: batchSize,
+        skip: chatsSkip,
       });
-      for (const message of messages) {
+      if (chats.length === 0) {
+        break;
+      }
+      for (const chat of chats) {
         const normalizedChat: NormalizedChat = {
           chatId: chat.chatId,
           name: chat.name,
@@ -443,45 +450,66 @@ export class WhatsappWebService implements OnModuleInit {
           lastMessageTimestamp: chat.lastMessageTimestamp,
           lastMessageFromMe: chat.lastMessageFromMe,
         };
-        const normalizedMessage: NormalizedMessage = {
-          messageId: message.messageId,
-          chatId: message.chatId,
-          body: message.body ?? '',
-          type: message.type,
-          from: message.from,
-          to: message.to,
-          author: message.author ?? null,
-          fromMe: message.fromMe,
-          isForwarded: message.isForwarded,
-          forwardingScore: 0,
-          isStatus: false,
-          hasMedia: message.hasMedia,
-          mediaType: message.mediaType ?? null,
-          hasQuotedMsg: message.hasQuotedMsg,
-          isStarred: message.isStarred,
-          isGif: false,
-          isEphemeral: false,
-          timestamp: message.timestamp,
-          ack: message.ack,
-          broadcast: false,
-          mentionedIds: [],
-          rawData: message.rawData ?? {},
-        };
-        const eventPayload = this.buildCustomersWhatsappUpsertEvent({
-          sessionId,
-          customerId: chat.customerId ? String(chat.customerId) : null,
-          normalizedChat,
-          normalizedMessage,
-          mediaMimeType: null,
-          mediaPath: message.mediaPath ?? null,
-          mediaFilename: message.mediaFilename ?? null,
-          syncMode: 'session_backfill',
-        });
-        this.rabbitService.emitToCustomersMs(
-          'customers.whatsapp.message.upsert.v1',
-          eventPayload,
-        );
+        let messagesSkip = 0;
+        while (true) {
+          const messages = await this.getStoredMessages(sessionId, chat.chatId, {
+            includeDeleted: false,
+            limit: batchSize,
+            skip: messagesSkip,
+          });
+          if (messages.length === 0) {
+            break;
+          }
+          for (const message of messages) {
+            const normalizedMessage: NormalizedMessage = {
+              messageId: message.messageId,
+              chatId: message.chatId,
+              body: message.body ?? '',
+              type: message.type,
+              from: message.from,
+              to: message.to,
+              author: message.author ?? null,
+              fromMe: message.fromMe,
+              isForwarded: message.isForwarded,
+              forwardingScore: 0,
+              isStatus: false,
+              hasMedia: message.hasMedia,
+              mediaType: message.mediaType ?? null,
+              hasQuotedMsg: message.hasQuotedMsg,
+              isStarred: message.isStarred,
+              isGif: false,
+              isEphemeral: false,
+              timestamp: message.timestamp,
+              ack: message.ack,
+              broadcast: false,
+              mentionedIds: [],
+              rawData: message.rawData ?? {},
+            };
+            const eventPayload = this.buildCustomersWhatsappUpsertEvent({
+              sessionId,
+              customerId: chat.customerId ? String(chat.customerId) : null,
+              normalizedChat,
+              normalizedMessage,
+              mediaMimeType: null,
+              mediaPath: message.mediaPath ?? null,
+              mediaFilename: message.mediaFilename ?? null,
+              syncMode: 'session_backfill',
+            });
+            this.rabbitService.emitToCustomersMs(
+              'customers.whatsapp.message.upsert.v1',
+              eventPayload,
+            );
+          }
+          if (messages.length < batchSize) {
+            break;
+          }
+          messagesSkip += messages.length;
+        }
       }
+      if (chats.length < batchSize) {
+        break;
+      }
+      chatsSkip += chats.length;
     }
   }
 
@@ -590,11 +618,11 @@ export class WhatsappWebService implements OnModuleInit {
       const isRestoring = session?.isRestoring || false;
       if (!isRestoring) {
         try {
-          const storedChats = await this.storageService.getStoredChats(sessionId);
-          this.rabbitService.emitToRecordsAiChatsAnalysisService('session_ready', {
-            sessionId,
-            chats: storedChats.map((chat) => chat.chatId),
-          });
+          // const storedChats = await this.storageService.getStoredChats(sessionId);
+          // this.rabbitService.emitToRecordsAiChatsAnalysisService('session_ready', {
+          //   sessionId,
+          //   chats: storedChats.map((chat) => chat.chatId),
+          // });
         } catch (error: unknown) {
           const msg = error instanceof Error ? error.message : String(error);
           this.logger.error(`Error emitting session_ready for ${sessionId}: ${msg}`);
