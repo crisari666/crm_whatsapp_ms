@@ -12,6 +12,18 @@ import { RabbitService } from 'src/rabbit.service';
 import { ClientsModule, Transport } from '@nestjs/microservices';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 
+function resolveRabbitMqUrl(configService: ConfigService): string {
+  const directUrl = configService.get<string>('RABBITMQ_URL', '').trim();
+  if (directUrl !== '') {
+    return directUrl;
+  }
+  const rabbitMqUser = configService.get<string>('RABBIT_MQ_USER', 'guest');
+  const rabbitMqPass = configService.get<string>('RABBIT_MQ_PASS', 'guest');
+  const rabbitMqHost = configService.get<string>('RABBIT_MQ_HOST', 'localhost');
+  const rabbitMqPort = configService.get<string>('RABBIT_MQ_PORT', '5672');
+  return `amqp://${rabbitMqUser}:${rabbitMqPass}@${rabbitMqHost}:${rabbitMqPort}`;
+}
+
 @Module({
   imports: [
     MongooseModule.forFeature(
@@ -26,19 +38,34 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         name: 'RECORDS_AI_CHATS_ANALYSIS_SERVICE',
         imports: [ConfigModule],
         useFactory: (configService: ConfigService) => {
-          const rabbitMqUser = configService.get<string>('RABBIT_MQ_USER', 'guest');
-          const rabbitMqPass = configService.get<string>('RABBIT_MQ_PASS', 'guest');
-          const rabbitMqUrl = `amqp://${rabbitMqUser}:${rabbitMqPass}@localhost:5672`;
-
           return {
             transport: Transport.RMQ,
             options: {
-              urls: [rabbitMqUrl],
-              queue: 'records_ai_chats_analysis_events', // where MS2 is listening
+              urls: [resolveRabbitMqUrl(configService)],
+              queue: configService.get<string>(
+                'RABBIT_QUEUE_RECORDS_AI',
+                'records_ai_chats_analysis_events',
+              ),
               queueOptions: { durable: true },
             },
           };
         },
+        inject: [ConfigService],
+      },
+      {
+        name: 'CUSTOMERS_MS_SERVICE',
+        imports: [ConfigModule],
+        useFactory: (configService: ConfigService) => ({
+          transport: Transport.RMQ,
+          options: {
+            urls: [resolveRabbitMqUrl(configService)],
+            queue: configService.get<string>(
+              'RABBIT_QUEUE_CUSTOMERS_MS',
+              'crm.customers.whatsapp_integration',
+            ),
+            queueOptions: { durable: true },
+          },
+        }),
         inject: [ConfigService],
       },
     ]),
