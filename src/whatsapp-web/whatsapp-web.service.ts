@@ -996,7 +996,7 @@ export class WhatsappWebService implements OnModuleInit {
     const out: NormalizedChat[] = [];
     for (const c of chats) {
       const sid = c.id._serialized;
-      if (sid.includes('status@broadcast')) {
+      if (!this.isSyncableChatId(sid)) {
         continue;
       }
       out.push(await this.wwebChatToNormalized(c));
@@ -1040,10 +1040,25 @@ export class WhatsappWebService implements OnModuleInit {
     return msg.includes('waitForChatLoading');
   }
 
+  private isSyncableChatId(chatId: string): boolean {
+    if (!chatId) {
+      return false;
+    }
+    if (chatId.includes('status@broadcast')) {
+      return false;
+    }
+    if (chatId === '0@c.us') {
+      return false;
+    }
+    return true;
+  }
+
   private async fetchMessagesWithGuard(chat: Chat, limit: number, chatId: string): Promise<Message[]> {
     try {
       return await chat.fetchMessages({ limit });
     } catch (error) {
+
+      console.log('error', JSON.stringify(error, null, 2));
       if (this.isWaitForChatLoadingError(error)) {
         this.logger.warn(`Skipping chat ${chatId}: ${error instanceof Error ? error.message : String(error)}`);
         return [];
@@ -1059,7 +1074,12 @@ export class WhatsappWebService implements OnModuleInit {
         throw new Error(`Session ${sessionId} is not connected or not ready`);
       }
       const id = decodeURIComponent(chatId);
+      if (!this.isSyncableChatId(id)) {
+        this.logger.warn(`Skipping non-syncable chat id: ${id}`);
+        return [];
+      }
       const chat = await session.client.getChatById(id);
+      
       const messages = await this.fetchMessagesWithGuard(chat, limit, id);
       const out = [];
       for (const m of messages) {
@@ -1124,7 +1144,7 @@ export class WhatsappWebService implements OnModuleInit {
       }
       const client = session.client;
       const chats = (await client.getChats()).filter(
-        (c) => !c.id._serialized.includes('status@broadcast'),
+        (c) => this.isSyncableChatId(c.id._serialized),
       );
       const nChats = chats.length;
       this.gateway.emitSyncChats(sessionId, {

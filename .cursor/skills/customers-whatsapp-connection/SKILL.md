@@ -31,6 +31,30 @@ Use this skill when the user asks to:
 - integrate `whatsapp-web.service.ts` message events with another microservice
 - introduce or update RabbitMQ communication between both repos
 - expose frontend-friendly customer + conversation retrieval APIs
+- support requests originating from `referrals-boost` that must persist auth token context for later flow requests
+
+## Referrals-Boost Token Continuity
+
+When a flow starts from `referrals-boost`, keep request auth continuity across every step that touches WhatsApp/customer sync.
+
+Required pattern:
+
+1. Accept bearer token (or equivalent access token) at the ingress request.
+2. Validate token format immediately; reject malformed/empty token fast.
+3. Persist only what is needed for future requests in the flow:
+   - preferred: short-lived token reference/key (not raw token)
+   - fallback (if reference store unavailable): encrypted token with TTL
+4. Attach token reference to flow correlation metadata (`sessionId`, `chatId`, `customerId`, or request correlation id).
+5. Rehydrate token context before downstream calls that require user-scoped auth.
+6. Rotate/refresh token state when new token is received.
+7. Remove expired token state and never keep indefinite token storage.
+
+Security and ownership rules:
+
+- Do not publish raw tokens in RabbitMQ payloads.
+- Do not log raw tokens in `crm_whatsapp_ms`, `crm-omega-customers-ms`, or frontend.
+- Keep token persistence in the service that executes future authenticated requests.
+- Prefer server-side token exchange/reference tokens over client-side long-lived secrets.
 
 ## Architecture Baseline
 
@@ -98,6 +122,7 @@ Keep this query model separate from raw event payload schema.
 - [ ] Add idempotency guard (by `messageId` + `sessionId`).
 - [ ] Add customer matching + unresolved fallback flow.
 - [ ] Add/update customers-ms API endpoint(s) for conversation retrieval.
+- [ ] If flow starts in `referrals-boost`, persist token context for future authenticated requests in the same flow.
 - [ ] Add integration tests for producer/consumer contract compatibility.
 - [ ] Add observability: logs, metrics, and dead-letter monitoring.
 

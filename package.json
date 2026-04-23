@@ -41,7 +41,7 @@
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.1",
     "socket.io": "^4.8.1",
-    "whatsapp-web.js": "github:themazim/whatsapp-web.js#fix/fetch-messages-merge-in-memory",
+    "whatsapp-web.js": "github:wwebjs/whatsapp-web.js#main",
     "wwebjs-mongo": "^1.1.0"
   },
   "devDependencies": {

@@ -46,10 +46,10 @@ export class WhatsappWebController {
     @Query('sessionId') querySessionId?: string,
   ) {
     const sid = (body?.sessionId ?? querySessionId)?.trim();
-    if (sid) {
-      return this.whatsappWebService.disconnectSession(sid);
+    if (!sid) {
+      throw new BadRequestException('sessionId is required');
     }
-    return this.whatsappWebService.disconnectAllActiveSessions();
+    return this.whatsappWebService.destroySession(sid);
   }
 
   @Post('session/:id')
