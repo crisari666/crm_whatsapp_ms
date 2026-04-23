@@ -1,5 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { Document } from 'mongoose';
+import { Document, Types } from 'mongoose';
 
 export type WhatsAppChatDocument = WhatsAppChat & Document;
 
@@ -12,6 +12,39 @@ export class WhatsAppChat {
   // Session ID to track which session the chat belongs to
   @Prop({ required: true, index: true })
   sessionId: string;
+
+  // Session owner id used to validate customer binding in multi-agent scenarios
+  @Prop({ required: false, index: true })
+  userSessionId?: string;
+
+  // Linked customer from crm-omega-customers-ms
+  @Prop({ type: Types.ObjectId, required: false, index: true, ref: 'Customer' })
+  customerId?: Types.ObjectId;
+
+  /** Last known peer contact (1:1); `userId` matches WhatsApp `id.user` for customer link. */
+  @Prop({
+    type: {
+      userId: { type: String, required: false, index: true },
+      serialized: { type: String, required: false },
+      waNumber: { type: String, required: false },
+      name: { type: String, required: false },
+      pushname: { type: String, required: false },
+      shortName: { type: String, required: false },
+      isBusiness: { type: Boolean, required: false },
+    },
+    required: false,
+    _id: false,
+  })
+  contact?: {
+    userId: string;
+    serialized?: string;
+    waNumber?: string;
+    name?: string;
+    pushname?: string;
+    shortName?: string;
+    isBusiness?: boolean;
+  };
+
   // Chat name
   @Prop({ required: true })
   name: string;
@@ -81,4 +114,5 @@ WhatsAppChatSchema.index({ sessionId: 1, archived: 1 });
 WhatsAppChatSchema.index({ sessionId: 1, pinned: 1 });
 WhatsAppChatSchema.index({ sessionId: 1, deleted: 1 });
 WhatsAppChatSchema.index({ sessionId: 1, chatId: 1 }, {unique: true});
+WhatsAppChatSchema.index({ userSessionId: 1, customerId: 1 });
 

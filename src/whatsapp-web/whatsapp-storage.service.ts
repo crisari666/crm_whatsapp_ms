@@ -1,11 +1,30 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { isValidObjectId, Model, Types } from 'mongoose';
 import { WhatsAppChat, WhatsAppChatDocument } from './schemas/whatsapp-chat.schema';
 import { WhatsAppMessage, WhatsAppMessageDocument } from './schemas/whatsapp-message.schema';
-import type { NormalizedChat, NormalizedMedia, NormalizedMessage } from './types/normalized-whatsapp.types';
+import type {
+  NormalizedChat,
+  NormalizedMedia,
+  NormalizedMessage,
+  WhatsappChatContactSnapshot,
+} from './types/normalized-whatsapp.types';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { RabbitService } from 'src/rabbit.service';
+
+/**
+ * Digits from the WhatsApp JID user part (before @). Used when {@link WhatsappChatContactSnapshot.userId}
+ * is missing (common for @lid peers) so the customers-ms RPC lookup can still run.
+ */
+function digitsFromChatId(chatId: string): string | null {
+  if (!chatId || chatId.endsWith('@g.us')) {
+    return null;
+  }
+  const userPart = chatId.split('@')[0] ?? '';
+  const digits = userPart.replace(/\D/g, '');
+  return digits.length > 0 ? digits : null;
+}
 
 @Injectable()
 export class WhatsappStorageService {
@@ -15,6 +34,7 @@ export class WhatsappStorageService {
   constructor(
     @InjectModel(WhatsAppChat.name) private whatsAppChatModel: Model<WhatsAppChatDocument>,
     @InjectModel(WhatsAppMessage.name) private whatsAppMessageModel: Model<WhatsAppMessageDocument>,
+    private readonly rabbitService: RabbitService,
   ) {
     // Ensure media directory exists
     this.ensureMediaDirectory();
@@ -36,7 +56,15 @@ export class WhatsappStorageService {
    * Save or update a chat in the database
    * Validates if the chat already exists to avoid duplicates
    */
-  async saveChat(sessionId: string, chat: NormalizedChat): Promise<void> {
+  async saveChat(
+    sessionId: string,
+    chat: NormalizedChat,
+    options?: {
+      customerId?: string | null;
+      userSessionId?: string;
+      contact?: WhatsappChatContactSnapshot | null;
+    },
+  ): Promise<string | null> {
     try {
       const chatData: Record<string, unknown> = {
         chatId: chat.chatId,
@@ -55,15 +83,85 @@ export class WhatsappStorageService {
         lastMessageFromMe: chat.lastMessageFromMe,
         deleted: false,
       };
+      const validSessionOwner =
+        options?.userSessionId !== undefined && options.userSessionId === sessionId;
+      if (validSessionOwner) {
+        chatData.userSessionId = options.userSessionId;
+      }
+      if (options?.contact?.userId) {
+        chatData.contact = options.contact;
+      }
+
+      // Sync path: RPC customers-ms during save so chat gets customerId immediately when match exists.
+      let resolvedCustomerId: string | null = null;
+      if (validSessionOwner && options?.customerId && isValidObjectId(options.customerId)) {
+        resolvedCustomerId = options.customerId;
+      } else if (validSessionOwner) {
+        const waUserId = options?.contact?.userId?.replace(/\D/g, '') || null;
+        console.log('waUserId', waUserId);
+        resolvedCustomerId = await this.resolveCustomerIdForChat(
+          sessionId,
+          chat.chatId,
+          waUserId,
+        );
+      }
+      if (validSessionOwner && resolvedCustomerId && isValidObjectId(resolvedCustomerId)) {
+        chatData.customerId = new Types.ObjectId(resolvedCustomerId);
+      }
+
       await this.whatsAppChatModel.findOneAndUpdate(
         { chatId: chat.chatId, sessionId },
         { $set: chatData, $setOnInsert: { deletedAt: [] } },
         { upsert: true, new: true }
       );
       this.logger.debug(`💾 Chat saved: ${chat.chatId}`);
+      return resolvedCustomerId;
     } catch (error) {
       this.logger.error(`Error saving chat: ${(error as Error).message}`);
       throw error;
+    }
+  }
+
+  private async resolveCustomerIdForChat(
+    sessionId: string,
+    chatId: string,
+    whatsappUserId: string | null,
+  ): Promise<string | null> {
+    if (!chatId || chatId.endsWith('@g.us')) {
+      return null;
+    }
+    const existing = await this.whatsAppChatModel
+      .findOne({ sessionId, chatId })
+      .select('customerId')
+      .lean()
+      .exec();
+    const existingCustomerId =
+      existing && typeof existing === 'object' && 'customerId' in existing && existing.customerId
+        ? String(existing.customerId)
+        : null;
+    if (existingCustomerId && isValidObjectId(existingCustomerId)) {
+      return existingCustomerId;
+    }
+    const phone = (whatsappUserId ?? '').replace(/\D/g, '');
+    console.log('phone', phone);
+    if (!phone) {
+      return null;
+    }
+
+    try {
+      const lookup = await this.rabbitService.lookupCustomerByWhatsappPhone({
+        phone,
+        userSessionId: sessionId,
+      });
+      if (!lookup?.found || !lookup.customerId || !isValidObjectId(lookup.customerId)) {
+        return null;
+      }
+      return lookup.customerId;
+    } catch (error) {
+      this.logger.warn(
+        `Customer lookup failed for chat ${chatId}: ${(error as Error).message}`,
+      );
+      return null;
     }
   }
 
@@ -73,6 +171,7 @@ export class WhatsappStorageService {
   async saveChats(
     sessionId: string,
     chats: NormalizedChat[],
+    options?: { userSessionId?: string },
     onProgress?: (currentIndex: number, total: number, chat: NormalizedChat) => void | Promise<void>
   ): Promise<void> {
     try {
@@ -96,6 +195,9 @@ export class WhatsappStorageService {
           lastMessageFromMe: chat.lastMessageFromMe,
           deleted: false,
         };
+        if (options?.userSessionId && options.userSessionId === sessionId) {
+          chatData.userSessionId = options.userSessionId;
+        }
         await this.whatsAppChatModel.findOneAndUpdate(
           { chatId: chat.chatId, sessionId },
           { $set: chatData, $setOnInsert: { deletedAt: [] } },
@@ -533,6 +635,34 @@ export class WhatsappStorageService {
       this.logger.debug(`✏️ Message media path updated: ${messageId}`);
     } catch (error) {
       this.logger.error(`Error updating message media path: ${error.message}`);
+    }
+  }
+
+  async assignCustomerToChat(params: {
+    sessionId: string;
+    chatId: string;
+    userSessionId: string;
+    customerId: string;
+  }): Promise<void> {
+    try {
+      console.log('Assigning customer to chat', params);
+      if (!isValidObjectId(params.customerId)) {
+        return;
+      }
+      await this.whatsAppChatModel.updateOne(
+        {
+          sessionId: params.sessionId,
+          chatId: params.chatId,
+          userSessionId: params.userSessionId,
+        },
+        {
+          $set: {
+            customerId: new Types.ObjectId(params.customerId),
+          },
+        },
+      );
+    } catch (error) {
+      this.logger.error(`Error assigning customer to chat: ${(error as Error).message}`);
     }
   }
 }

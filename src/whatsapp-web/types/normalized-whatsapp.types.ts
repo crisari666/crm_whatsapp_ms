@@ -30,6 +30,19 @@ export interface NormalizedMessage {
   rawData: object;
 }
 
+/** Peer contact snapshot persisted on chat (from wweb.js getContact + JID fallback). */
+export interface WhatsappChatContactSnapshot {
+  /** WhatsApp `id.user` (digits, e.g. country + national). Used for customer-ms lookup. */
+  userId: string;
+  serialized?: string;
+  /** Library `number` (may differ from userId on newer WA builds). */
+  waNumber?: string;
+  name?: string;
+  pushname?: string;
+  shortName?: string;
+  isBusiness?: boolean;
+}
+
 /** Normalized chat input for storage */
 export interface NormalizedChat {
   chatId: string;

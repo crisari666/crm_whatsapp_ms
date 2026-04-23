@@ -218,4 +218,31 @@ export class WhatsappWebController {
     }
   }
 
+  @EventPattern('customers.whatsapp.chat.lookup.resolved.v1')
+  async handleCustomerLookupResolved(
+    @Payload()
+    payload: {
+      sessionId?: string;
+      userSessionId?: string;
+      chatId?: string;
+      customerId?: string;
+    },
+  ) {
+    console.log('handleCustomerLookupResolved', payload);
+    if (
+      !payload?.sessionId ||
+      !payload?.chatId ||
+      !payload?.customerId ||
+      !payload?.userSessionId
+    ) {
+      return;
+    }
+    await this.whatsappWebService.handleCustomerLookupResolved({
+      sessionId: payload.sessionId,
+      userSessionId: payload.userSessionId,
+      chatId: payload.chatId,
+      customerId: payload.customerId,
+    });
+  }
+
 }
