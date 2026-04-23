@@ -403,17 +403,12 @@ export class WhatsappStorageService {
     try {
       const query: any = { sessionId };
 
-      console.log({ options });
-
       if (options?.archived !== undefined) {
         query.archived = options.archived;
       }
-
       if (options?.isGroup !== undefined) {
         query.isGroup = options.isGroup;
       }
-
-      console.log({ query });
 
       const chats = await this.whatsAppChatModel
         .find(query)
