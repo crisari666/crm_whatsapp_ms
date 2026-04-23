@@ -14,7 +14,9 @@ import { Logger } from '@nestjs/common';
   cors: {
     origin: '*',
   },
+
   transports: ['websocket'],
+  path: '/ws-socket',
   namespace: '/ws-rest',
 })
 export class WhatsappWebGateway implements OnGatewayConnection, OnGatewayDisconnect {
